@@ -135,6 +135,8 @@ type BlockChain struct {
 
 	badBlocks      *lru.Cache              // Bad block cache
 	shouldPreserve func(*types.Block) bool // Function used to determine whether should preserve the given block.
+	
+	nextStateFlush time.Time // Time for next state trie flush
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -171,6 +173,7 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		engine:         engine,
 		vmConfig:       vmConfig,
 		badBlocks:      badBlocks,
+		nextStateFlush: time.Now().Add(cacheConfig.TrieTimeLimit),
 	}
 	bc.SetValidator(NewBlockValidator(chainConfig, bc, engine))
 	bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine))
@@ -700,24 +703,11 @@ func (bc *BlockChain) Stop() {
 
 	bc.wg.Wait()
 
-	// Ensure the state of a recent block is also stored to disk before exiting.
-	// We're writing three different states to catch different restart scenarios:
-	//  - HEAD:     So we don't need to reprocess any blocks in the general case
-	//  - HEAD-1:   So we don't do large reorgs if our HEAD becomes an uncle
-	//  - HEAD-127: So we have a hard limit on the number of blocks reexecuted
 	if !bc.cacheConfig.Disabled {
 		triedb := bc.stateCache.TrieDB()
-
-		for _, offset := range []uint64{0, 1, triesInMemory - 1} {
-			if number := bc.CurrentBlock().NumberU64(); number > offset {
-				recent := bc.GetBlockByNumber(number - offset)
-
-				log.Info("Writing cached state to disk", "block", recent.Number(), "hash", recent.Hash(), "root", recent.Root())
-				if err := triedb.Commit(recent.Root(), true); err != nil {
-					log.Error("Failed to commit recent state trie", "err", err)
-				}
-			}
-		}
+		
+		bc.flushStateToDisk(triedb)
+		
 		for !bc.triegc.Empty() {
 			triedb.Dereference(bc.triegc.PopItem().(common.Hash))
 		}
@@ -726,6 +716,25 @@ func (bc *BlockChain) Stop() {
 		}
 	}
 	log.Info("Blockchain manager stopped")
+}
+
+func (bc *BlockChain) flushStateToDisk(triedb *trie.Database) {
+	// Ensure the state of a recent block is also stored to disk before exiting.
+	// We're writing three different states to catch different restart scenarios:
+	//  - HEAD:     So we don't need to reprocess any blocks in the general case
+	//  - HEAD-1:   So we don't do large reorgs if our HEAD becomes an uncle
+	//  - HEAD-127: So we have a hard limit on the number of blocks reexecuted
+
+	for _, offset := range []uint64{0, 1, triesInMemory - 1} {
+		if number := bc.CurrentBlock().NumberU64(); number > offset {
+			recent := bc.GetBlockByNumber(number - offset)
+
+			log.Info("Writing cached state to disk", "block", recent.Number(), "hash", recent.Hash(), "root", recent.Root())
+			if err := triedb.Commit(recent.Root(), true); err != nil {
+				log.Error("Failed to commit recent state trie", "err", err)
+			}
+		}
+	}
 }
 
 func (bc *BlockChain) procFutureBlocks() {
@@ -1002,6 +1011,15 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 					break
 				}
 				triedb.Dereference(root.(common.Hash))
+			}
+		}
+
+		// If enough time has passed flush state to disk.
+		tstamp := time.Now()
+		if tstamp.After(bc.nextStateFlush) {
+			bc.flushStateToDisk(triedb)
+			for tstamp.After(bc.nextStateFlush) {
+				bc.nextStateFlush = bc.nextStateFlush.Add(bc.cacheConfig.TrieTimeLimit)
 			}
 		}
 	}
