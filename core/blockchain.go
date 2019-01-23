@@ -75,6 +75,7 @@ type CacheConfig struct {
 	TrieCleanLimit int           // Memory allowance (MB) to use for caching trie nodes in memory
 	TrieDirtyLimit int           // Memory limit (MB) at which to start flushing dirty trie nodes to disk
 	TrieTimeLimit  time.Duration // Time limit after which to flush the current in-memory trie to disk
+	TrieFlushPeriodLimit time.Duration // Time for periodic flush of state trie
 }
 
 // BlockChain represents the canonical chain given a database with a genesis
@@ -136,6 +137,8 @@ type BlockChain struct {
 
 	badBlocks      *lru.Cache              // Bad block cache
 	shouldPreserve func(*types.Block) bool // Function used to determine whether should preserve the given block.
+
+	nextTrieFlush time.Time // Time for next state trie flush
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -172,6 +175,7 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		engine:         engine,
 		vmConfig:       vmConfig,
 		badBlocks:      badBlocks,
+		nextTrieFlush: time.Now().Add(cacheConfig.TrieFlushPeriodLimit),
 	}
 	bc.SetValidator(NewBlockValidator(chainConfig, bc, engine))
 	bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine))
@@ -986,7 +990,19 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 				triedb.Commit(header.Root, true)
 				lastWrite = chosen
 				bc.gcproc = 0
+			} else {
+				// If enough time has passed flush the chosen state trie.
+				tstamp := time.Now()
+				if tstamp.After(bc.nextTrieFlush) {
+					log.Info("Periodic flush of trie state", "number", chosen)
+					triedb.Commit(header.Root, true)
+					for tstamp.After(bc.nextTrieFlush) {
+						bc.nextTrieFlush =
+							bc.nextTrieFlush.Add(bc.cacheConfig.TrieFlushPeriodLimit)
+					}
+				}
 			}
+			
 			// Garbage collect anything below our required write retention
 			for !bc.triegc.Empty() {
 				root, number := bc.triegc.Pop()
